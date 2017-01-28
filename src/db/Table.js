@@ -1,6 +1,7 @@
 import reject from 'lodash/reject';
 import filter from 'lodash/filter';
 import orderBy from 'lodash/orderBy';
+import intersection from 'lodash/intersection';
 import ops from 'immutable-ops';
 
 import { FILTER, EXCLUDE, ORDER_BY } from '../constants';
@@ -11,6 +12,7 @@ const DEFAULT_OPTS = {
     idAttribute: 'id',
     arrName: 'items',
     mapName: 'itemsById',
+    useIndex: true,
 };
 
 // Input is the current max id and the new id passed to the create action.
@@ -56,6 +58,7 @@ const Table = class Table {
      * @param  {string} [userOpts.mapName=itemsById] - the state attribute where the entity objects
      *                                                 are stored in a id to entity object
      *                                                 map.
+     * @param  {boolean} [userOpts.useIndex=true] - enable/disable index lookup in queries
      */
     constructor(userOpts) {
         Object.assign(this, DEFAULT_OPTS, userOpts);
@@ -107,8 +110,25 @@ const Table = class Table {
                     // return that.
                     const id = payload[this.idAttribute];
                     return this.idExists(branch, id)
-                        ? [this.accessId(branch, payload[this.idAttribute])]
+                        ? [this.accessId(branch, id)]
                         : [];
+                }
+
+                if (this.useIndex) {
+                    let filteredByIndex = false;
+                    let idsIntersection;
+                    intersection(Object.keys(payload), this.getIndexedFields()).forEach(fieldName => {
+                        const filterValue = payload[fieldName];
+                        const fieldIndex = branch.__indexes[fieldName] || {};
+                        const ids = fieldIndex[filterValue] || [];
+
+                        idsIntersection = filteredByIndex ? intersection(idsIntersection, ids) : ids;
+                        filteredByIndex = true;
+                    });
+
+                    if (filteredByIndex) {
+                        return filter(idsIntersection.map(id => this.accessId(branch, id)), payload);
+                    }
                 }
                 return filter(rows, payload);
             }
@@ -134,7 +154,74 @@ const Table = class Table {
             [this.arrName]: [],
             [this.mapName]: {},
             meta: {},
+            __indexes: {},
         };
+    }
+
+    insertToIndex(tx, branch, id, fieldOpts, fieldName, value) {
+        const { batchToken, withMutations } = tx;
+        const { isUnique } = fieldOpts;
+        let fieldIndex = branch.__indexes[fieldName] || {};
+        let valueIndex = fieldIndex[value];
+        let workingState = branch;
+
+        if (isUnique && value !== null) {
+            valueIndex = [id];
+        } else {
+            valueIndex = valueIndex || [];
+
+            if (withMutations) {
+                ops.mutable.push(id, valueIndex);
+            } else {
+                valueIndex = ops.batch.push(batchToken, id, valueIndex);
+            }
+        }
+
+        if (withMutations) {
+            return ops.mutable.setIn(['__indexes', fieldName, value], valueIndex, workingState);
+        } else {
+            return ops.batch.setIn(batchToken, ['__indexes', fieldName, value], valueIndex, workingState);
+        }
+    }
+
+    deleteFromIndex(tx, branch, id, fieldOpts, fieldName, value) {
+        const { batchToken, withMutations } = tx;
+        const { isUnique } = fieldOpts;
+        let workingState = branch;
+        let fieldIndex = workingState.__indexes[fieldName];
+
+        if (isUnique && value !== null) {
+            if (withMutations) {
+                ops.mutable.omit(value, fieldIndex);
+                return workingState;
+            } else {
+                return ops.batch.merge(batchToken, {
+                    __indexes: ops.batch.merge(batchToken, {
+                        [fieldName]: ops.batch.omit(batchToken, value, fieldIndex)
+                    }, workingState.__indexes)
+                }, workingState);
+            }
+        } else {
+            if (withMutations) {
+                ops.mutable.filter(indexedId => indexedId !== id, fieldIndex[value]);
+                return workingState;
+            } else {
+                return ops.batch.merge(batchToken, {
+                    __indexes: ops.batch.merge(batchToken, {
+                        [fieldName]: ops.batch.merge(batchToken, {
+                            [value]: ops.batch.filter(batchToken, indexedId => indexedId !== id, fieldIndex[value])
+                        }, fieldIndex)
+                    }, workingState.__indexes)
+                }, workingState); 
+            }
+        }
+    }
+
+    getIndexedFields() {
+        return Object.keys(this.fields).filter(fieldName => {
+            const fieldOpts = this.fields[fieldName].opts || {};
+            return fieldOpts.index || fieldOpts.isUnique;
+        });
     }
 
     setMeta(tx, branch, key, value) {
@@ -175,6 +262,11 @@ const Table = class Table {
             ? entry
             : ops.batch.set(batchToken, this.idAttribute, id, entry);
 
+        this.getIndexedFields().forEach(fieldName => {
+            const fieldOpts = this.fields[fieldName].opts || {};
+            workingState = this.insertToIndex(tx, workingState, id, fieldOpts, fieldName, entry[fieldName]);
+        });
+
         if (withMutations) {
             ops.mutable.push(id, workingState[this.arrName]);
             ops.mutable.set(id, finalEntry, workingState[this.mapName]);
@@ -208,6 +300,8 @@ const Table = class Table {
     update(tx, branch, rows, mergeObj) {
         const { batchToken, withMutations } = tx;
 
+        let workingState = branch;
+
         const {
             mapName,
         } = this;
@@ -223,7 +317,19 @@ const Table = class Table {
             const result = mapFunction(row);
             return set(result[this.idAttribute], result, map);
         }, branch[mapName]);
-        return ops.batch.set(batchToken, mapName, newMap, branch);
+        workingState = ops.batch.set(batchToken, mapName, newMap, branch);
+
+        // delete old index and createa new one
+        this.getIndexedFields().forEach(fieldName => {
+            const fieldOpts = this.fields[fieldName].opts || {};
+            rows.forEach(row => {
+                workingState = this.deleteFromIndex(tx, workingState, row[this.idAttribute], fieldOpts, fieldName, row[fieldName]);
+                const result = mapFunction(row);
+                workingState = this.insertToIndex(tx, workingState, result[this.idAttribute], fieldOpts, fieldName, result[fieldName]);
+            })
+        });
+
+        return workingState;
     }
 
     /**
@@ -238,6 +344,13 @@ const Table = class Table {
 
         const { arrName, mapName } = this;
         const arr = branch[arrName];
+
+        this.getIndexedFields().forEach(fieldName => {
+            const fieldOpts = this.fields[fieldName].opts || {};
+            rows.forEach(row => {
+                branch = this.deleteFromIndex(tx, branch, row[this.idAttribute], fieldOpts, fieldName, row[fieldName]);
+            });
+        });
 
         const idsToDelete = rows.map(row => row[this.idAttribute]);
         if (withMutations) {
