@@ -101,7 +101,42 @@ const Table = class Table {
         return id + 1;
     }
 
+    /**
+     * Returns an array of ids that corresond to given fieldName and value
+     *
+     * @param  {Object} branch - the state
+     * @param  {String} fieldName - field
+     * @param  {*} value - indexed value
+     * @return {Array} - ids of objects that were indexed
+     */
+    getIdListByIndex(branch, fieldName, value) {
+        const fieldIndex = branch.__indexes[fieldName] || {};
+        return fieldIndex[value] || [];
+    }
+
     query(branch, clauses) {
+        let list;
+
+        if(this.useIndex) {
+            // start with a list of items filtered by indexes if there are any indexed fields in filter payload
+            const indexedFields = this.getIndexedFields();
+            let idsIntersection;
+            let isFilteredByIndex = false;
+            clauses.forEach(({ type, payload }) => {
+                if(type === FILTER) {
+                    intersection(Object.keys(payload), indexedFields).forEach(fieldName => {
+                        const ids = this.getIdListByIndex(branch, fieldName, payload[fieldName]);
+                        idsIntersection = isFilteredByIndex ? intersection(idsIntersection, ids) : ids;
+                        isFilteredByIndex = true;
+                    });
+                }
+            });
+
+            list = isFilteredByIndex ? idsIntersection.map(id => this.accessId(branch, id)) : this.accessList(branch);
+        } else {
+            list = this.accessList(branch);
+        }
+
         return clauses.reduce((rows, { type, payload }) => {
             switch (type) {
             case FILTER: {
@@ -109,27 +144,9 @@ const Table = class Table {
                     // Payload specified a primary key; Since that is unique, we can directly
                     // return that.
                     const id = payload[this.idAttribute];
-                    return this.idExists(branch, id)
-                        ? [this.accessId(branch, id)]
-                        : [];
+                    return this.idExists(branch, id) ? this.accessId(branch, id) : [];
                 }
 
-                if (this.useIndex) {
-                    let filteredByIndex = false;
-                    let idsIntersection;
-                    intersection(Object.keys(payload), this.getIndexedFields()).forEach(fieldName => {
-                        const filterValue = payload[fieldName];
-                        const fieldIndex = branch.__indexes[fieldName] || {};
-                        const ids = fieldIndex[filterValue] || [];
-
-                        idsIntersection = filteredByIndex ? intersection(idsIntersection, ids) : ids;
-                        filteredByIndex = true;
-                    });
-
-                    if (filteredByIndex) {
-                        return filter(idsIntersection.map(id => this.accessId(branch, id)), payload);
-                    }
-                }
                 return filter(rows, payload);
             }
             case EXCLUDE: {
@@ -142,7 +159,7 @@ const Table = class Table {
             default:
                 return rows;
             }
-        }, this.accessList(branch));
+        }, list);
     }
 
     /**
